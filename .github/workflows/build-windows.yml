@@ -1,0 +1,91 @@
+# Builda o DeskcommCRM num runner WINDOWS e publica o standalone como artefato.
+#
+# Por que windows-latest e não ubuntu: o build copia binário NATIVO por
+# plataforma (@napi-rs/canvas, sharp). Um standalone gerado no Linux traz .node
+# de Linux e falha no Windows no primeiro uso de PDF/planilha. O runner tem de
+# ser o mesmo sistema em que o app vai rodar.
+#
+# Por que o passo de copiar static/public: `output: "standalone"` não inclui
+# nenhum dos dois. Sem eles a tela abre sem CSS — é o mesmo motivo pelo qual o
+# Dockerfile copia os dois na mão.
+#
+# Rode em: Actions → "build-windows" → Run workflow. Depois baixe o artefato
+# `deskcomm-crm-windows`, descompacte e execute `node server.js`.
+name: build-windows
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Instalar dependências
+        run: pnpm install --frozen-lockfile
+
+      # Os mesmos placeholders do Dockerfile: o build não pode receber segredo,
+      # e os valores reais entram em RUNTIME pelo .env.local do operador.
+      - name: Build (Turbopack)
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NODE_OPTIONS: "--max-old-space-size=4096"
+          NEXT_PUBLIC_SUPABASE_URL: "https://placeholder.supabase.co"
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: "placeholder-anon-key"
+          NEXT_PUBLIC_APP_URL: "https://placeholder.invalid"
+          NEXT_PUBLIC_ADMIN_URL: "https://placeholder.invalid"
+        run: pnpm build
+
+      - name: Montar pacote (standalone + static + public)
+        shell: pwsh
+        run: |
+          $saida = ".next/standalone"
+          if (-not (Test-Path $saida)) { throw "sem .next/standalone — o build não gerou output standalone" }
+          New-Item -ItemType Directory -Force -Path "$saida/.next" | Out-Null
+          Copy-Item -Recurse -Force ".next/static" "$saida/.next/static"
+          Copy-Item -Recurse -Force "public" "$saida/public"
+          Compress-Archive -Path "$saida/*" -DestinationPath "app-windows.zip" -CompressionLevel Optimal
+          $mb = [math]::Round((Get-Item "app-windows.zip").Length / 1MB, 1)
+          Write-Host "app-windows.zip = $mb MB"
+
+      # Prova mínima de que o pacote não está oco: o server.js e o CSS precisam
+      # estar dentro do zip, senão o app sobe sem estilo e o download engana.
+      - name: Conferir conteúdo do pacote
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD/app-windows.zip")
+          try {
+            $nomes = $zip.Entries | ForEach-Object { $_.FullName }
+            foreach ($obrigatorio in @("server.js", "package.json")) {
+              if (-not ($nomes -contains $obrigatorio)) { throw "faltou $obrigatorio no pacote" }
+            }
+            $css = @($nomes | Where-Object { $_ -like ".next/static/*" }).Count
+            if ($css -eq 0) { throw "faltou .next/static no pacote — a tela subiria sem CSS" }
+            Write-Host "ok: $($nomes.Count) entradas, $css arquivos em .next/static"
+          } finally { $zip.Dispose() }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskcomm-crm-windows
+          path: app-windows.zip
+          retention-days: 14
+          if-no-files-found: error
