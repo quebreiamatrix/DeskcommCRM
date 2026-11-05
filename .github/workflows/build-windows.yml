@@ -54,6 +54,11 @@ jobs:
           NEXT_PUBLIC_ADMIN_URL: "https://placeholder.invalid"
         run: pnpm build
 
+      # `tar -L` (dereference) em vez de Compress-Archive: o standalone do pnpm é
+      # cheio de symlink em node_modules/.pnpm/node_modules/<pkg>, e o
+      # Compress-Archive morre com "Could not find a part of the path" no
+      # primeiro deles. O -L materializa o alvo, e o pacote vira uma árvore
+      # comum — que é o que o Windows precisa para rodar sem privilégio de link.
       - name: Montar pacote (standalone + static + public)
         shell: pwsh
         run: |
@@ -62,30 +67,28 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$saida/.next" | Out-Null
           Copy-Item -Recurse -Force ".next/static" "$saida/.next/static"
           Copy-Item -Recurse -Force "public" "$saida/public"
-          Compress-Archive -Path "$saida/*" -DestinationPath "app-windows.zip" -CompressionLevel Optimal
-          $mb = [math]::Round((Get-Item "app-windows.zip").Length / 1MB, 1)
-          Write-Host "app-windows.zip = $mb MB"
+          tar.exe -czf "app-windows.tar.gz" -L -C $saida .
+          if ($LASTEXITCODE -ne 0) { throw "tar falhou com exit $LASTEXITCODE" }
+          $mb = [math]::Round((Get-Item "app-windows.tar.gz").Length / 1MB, 1)
+          Write-Host "app-windows.tar.gz = $mb MB"
 
-      # Prova mínima de que o pacote não está oco: o server.js e o CSS precisam
-      # estar dentro do zip, senão o app sobe sem estilo e o download engana.
+      # Prova mínima de que o pacote não está oco: server.js e o CSS precisam
+      # estar dentro, senão o app sobe sem estilo e o download engana.
       - name: Conferir conteúdo do pacote
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD/app-windows.zip")
-          try {
-            $nomes = $zip.Entries | ForEach-Object { $_.FullName }
-            foreach ($obrigatorio in @("server.js", "package.json")) {
-              if (-not ($nomes -contains $obrigatorio)) { throw "faltou $obrigatorio no pacote" }
-            }
-            $css = @($nomes | Where-Object { $_ -like ".next/static/*" }).Count
-            if ($css -eq 0) { throw "faltou .next/static no pacote — a tela subiria sem CSS" }
-            Write-Host "ok: $($nomes.Count) entradas, $css arquivos em .next/static"
-          } finally { $zip.Dispose() }
+          $lista = tar.exe -tzf "app-windows.tar.gz"
+          if ($LASTEXITCODE -ne 0) { throw "não consegui listar o pacote" }
+          foreach ($obrigatorio in @("./server.js", "./package.json")) {
+            if (-not ($lista -contains $obrigatorio)) { throw "faltou $obrigatorio no pacote" }
+          }
+          $css = @($lista | Where-Object { $_ -like "./.next/static/*" }).Count
+          if ($css -eq 0) { throw "faltou .next/static no pacote — a tela subiria sem CSS" }
+          Write-Host "ok: $($lista.Count) entradas, $css arquivos em .next/static"
 
       - uses: actions/upload-artifact@v4
         with:
           name: deskcomm-crm-windows
-          path: app-windows.zip
+          path: app-windows.tar.gz
           retention-days: 14
           if-no-files-found: error
